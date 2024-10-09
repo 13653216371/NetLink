@@ -1,9 +1,12 @@
 name: Rust
 
 on:
-  push:
-    tags:
-      - '*'
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: '自定义prerelease预发布的版本号'
+        required: true
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
