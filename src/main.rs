@@ -1,8 +1,6 @@
 use clap::Parser;
 use env_logger::Env;
-use pnet_packet::icmp::IcmpTypes;
-use pnet_packet::ip::IpNextHeaderProtocols;
-use pnet_packet::Packet;
+
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -18,14 +16,14 @@ use tokio::sync::mpsc::Sender;
 #[command(version, about, long_about = None)]
 struct Args {
     /// Peer node address.
-    /// example: --peer tcp://192.168.10.13:23333 --peer udp://192.168.10.23:23333
+    /// e.g.: --peer tcp://192.168.10.13:23333 --peer udp://192.168.10.23:23333
     #[arg(short, long)]
     peer: Option<Vec<String>>,
     /// Local node IP and mask.
-    /// example: --local 10.26.0.2/24
+    /// e.g.: --local 10.26.0.2/24
     #[arg(short, long)]
     local: String,
-    /// Nodes with the same group_comde can form a network
+    /// Nodes with the same group_code can form a network (Maximum length 16)
     #[arg(short, long)]
     group_code: String,
     /// Listen local port
@@ -197,8 +195,11 @@ async fn tun_recv(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(target_os = "macos")]
 async fn process_myself(payload: &[u8], device: &Arc<AsyncDevice>) -> Result<()> {
+    use pnet_packet::icmp::IcmpTypes;
+    use pnet_packet::ip::IpNextHeaderProtocols;
+    use pnet_packet::Packet;
     if let Some(ip_packet) = pnet_packet::ipv4::Ipv4Packet::new(payload) {
         match ip_packet.get_next_level_protocol() {
             IpNextHeaderProtocols::Icmp => {
