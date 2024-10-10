@@ -4,14 +4,16 @@ use env_logger::Env;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::Arc;
-use tun_rs::AsyncDevice;
+use tun_rs::{AbstractDevice, AsyncDevice};
 
+use crate::route_listen::ExternalRoute;
 use rustp2p::config::{PipeConfig, TcpPipeConfig, UdpPipeConfig};
 use rustp2p::error::*;
 use rustp2p::pipe::{PeerNodeAddress, Pipe, PipeLine, PipeWriter, RecvUserData};
 use rustp2p::protocol::node_id::GroupCode;
 use tokio::sync::mpsc::Sender;
 
+mod route_listen;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -39,7 +41,7 @@ pub async fn main() -> Result<()> {
         group_code,
         port,
     } = Args::parse();
-    env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let mut split = local.split("/");
     let self_id = Ipv4Addr::from_str(split.next().expect("--local error")).expect("--local error");
     let mask = if let Some(mask) = split.next() {
@@ -88,6 +90,12 @@ pub async fn main() -> Result<()> {
                 .up(),
         )
         .unwrap();
+        let if_index = device.if_index().unwrap();
+        let name = device.name().unwrap();
+        log::info!("device index={if_index},name={name}",);
+        let external_route = ExternalRoute::new();
+        route_listen::route_listen(if_index, external_route.clone()).await?;
+
         #[cfg(target_os = "macos")]
         {
             use tun_rs::AbstractDevice;
@@ -96,7 +104,9 @@ pub async fn main() -> Result<()> {
         let device = Arc::new(device);
         let device_r = device.clone();
         tokio::spawn(async move {
-            tun_recv(writer, device_r, self_id).await.unwrap();
+            tun_recv(writer, device_r, self_id, external_route)
+                .await
+                .unwrap();
         });
 
         tokio::spawn(async move {
@@ -111,11 +121,15 @@ pub async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         loop {
-            let line = pipe.accept().await?;
-            tokio::spawn(recv(line, sender.clone()));
+            match pipe.accept().await {
+                Ok(line) => {
+                    tokio::spawn(recv(line, sender.clone()));
+                }
+                Err(e) => {
+                    log::error!("pipe.accept {e:?}");
+                }
+            }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), Error>(())
     });
 
     quit.recv().await.expect("quit error");
@@ -158,6 +172,7 @@ async fn tun_recv(
     pipe_writer: PipeWriter,
     device: Arc<AsyncDevice>,
     _self_id: Ipv4Addr,
+    external_route: ExternalRoute,
 ) -> Result<()> {
     loop {
         let mut send_packet = pipe_writer.allocate_send_packet();
@@ -185,11 +200,12 @@ async fn tun_recv(
                 continue;
             }
         }
-
-        if let Err(e) = pipe_writer
-            .send_packet_to(send_packet, &dest_ip.into())
-            .await
-        {
+        let dest = if let Some(next_hop) = external_route.route(&dest_ip) {
+            next_hop.into()
+        } else {
+            dest_ip.into()
+        };
+        if let Err(e) = pipe_writer.send_packet_to(send_packet, &dest).await {
             log::warn!("discard,{dest_ip:?} {e:?}")
         }
     }
