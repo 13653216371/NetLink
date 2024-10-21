@@ -1,24 +1,31 @@
 use clap::Parser;
 use env_logger::Env;
-use std::io;
+use std::future::Future;
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use anyhow::anyhow;
+use async_shutdown::ShutdownManager;
+use clap::error::ErrorKind;
+use futures::FutureExt;
+use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tun_rs::{AbstractDevice, AsyncDevice};
 
+use crate::config::{ConfigView, FileConfigView};
+use crate::ipc::service::ApiService;
 use crate::route_listen::ExternalRoute;
-use rustp2p::config::{LocalInterface, PipeConfig, TcpPipeConfig, UdpPipeConfig};
-use rustp2p::error::*;
-use rustp2p::pipe::{PeerNodeAddress, Pipe, PipeLine, PipeWriter, RecvError, RecvUserData};
+use rustp2p::config::{PipeConfig, TcpPipeConfig, UdpPipeConfig};
+use rustp2p::pipe::{Pipe, PipeLine, PipeWriter, RecvError, RecvUserData};
 use rustp2p::protocol::node_id::{GroupCode, NodeID};
 use tokio::sync::mpsc::Sender;
 
 mod cipher;
+mod config;
 mod exit_route;
 mod ipc;
 mod platform;
 mod route_listen;
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -26,7 +33,7 @@ struct Args {
     /// Peer node address.
     /// e.g.: -p tcp://192.168.10.13:23333 -p udp://192.168.10.23:23333
     #[arg(short, long)]
-    peer: Option<Vec<String>>,
+    peer: Vec<String>,
     /// Local node IP and prefix.If there is no 'prefix', Will not enable Tun.
     /// e.g.: -l 10.26.0.2/24
     #[arg(short, long, value_name = "LOCAL IP")]
@@ -53,24 +60,36 @@ struct Args {
     algorithm: Option<String>,
     /// Global exit node,please use it together with '--bind-dev'
     #[arg(long)]
-    exit_node: Option<Ipv4Addr>,
+    exit_node: Option<String>,
     /// Set tun name
     #[arg(long)]
     tun_name: Option<String>,
+    /// Start using configuration file
+    #[arg(short = 'f', long)]
+    config: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
+
+#[derive(Parser, Debug)]
+struct ArgsConfig {
+    #[arg(short = 'f', long)]
+    config: String,
+}
+
 #[derive(Parser, Debug)]
 struct ArgsBack {
-    #[arg(long)]
-    cmd_port: Option<u16>,
     #[command(subcommand)]
     command: Commands,
 }
+
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
     /// Backend command
     Cmd {
+        /// set backend server host. default 127.0.0.1
+        #[arg(long)]
+        cmd_host: Option<String>,
         /// When opening multiple programs, this port needs to be set. default 23336
         #[arg(long)]
         cmd_port: Option<u16>,
@@ -88,71 +107,94 @@ enum Commands {
         others: Option<String>,
     },
 }
+
+const CMD_HOST: &str = "127.0.0.1";
 const CMD_PORT: u16 = 23336;
 const LISTEN_PORT: u16 = 23333;
 
-pub fn main() -> Result<()> {
+pub fn main() -> anyhow::Result<()> {
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let args = match Args::try_parse() {
         Ok(arg) => arg,
         Err(e) => {
-            match ArgsBack::try_parse() {
-                Ok(args) => {
-                    client_cmd(args);
-                }
-                Err(_) => {
-                    println!("{e}");
-                }
+            if e.kind() == ErrorKind::DisplayHelp {
+                println!("{e}");
+                return Ok(());
             }
+            if let Ok(args) = ArgsBack::try_parse() {
+                return client_cmd(args);
+            }
+            if let Ok(args) = ArgsConfig::try_parse() {
+                let file_config = FileConfigView::read_file(&args.config)?;
+                let worker_threads = file_config.threads;
+                return block_on(worker_threads, async move {
+                    main_by_config_file(file_config).boxed().await
+                });
+            }
+            println!("{e}");
             return Ok(());
         }
     };
     let worker_threads = args.threads.unwrap_or(2);
+    block_on(
+        worker_threads,
+        async move { main_by_cmd(args).boxed().await },
+    )
+}
+
+fn block_on<F: Future>(worker_threads: usize, f: F) -> F::Output {
     if worker_threads <= 1 {
-        main_current_thread(args)
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
     } else {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .enable_all()
             .build()
             .unwrap()
-            .block_on(run(args))
+            .block_on(f)
     }
 }
+
 #[tokio::main(flavor = "current_thread")]
-async fn client_cmd(args: ArgsBack) {
+async fn client_cmd(args: ArgsBack) -> anyhow::Result<()> {
     let Commands::Cmd {
+        cmd_host,
         cmd_port,
         info,
         nodes,
         groups,
         others,
     } = args.command;
+    let host = cmd_host.unwrap_or(CMD_HOST.to_string());
+    let port = cmd_port.unwrap_or(CMD_PORT);
+    let addr = format!("{host}:{port}");
     if nodes {
-        if let Err(e) = ipc::client::nodes(cmd_port.unwrap_or(CMD_PORT)).await {
-            println!("Perhaps the backend service has not been started. Use '--cmd-port' to change the port. error={e}");
+        if let Err(e) = ipc::udp::client::nodes(addr).await {
+            Err(anyhow!("Perhaps the backend service has not been started. Use '--cmd-port' to change the port. error={e}"))?;
         }
     } else if groups {
-        if let Err(e) = ipc::client::groups(cmd_port.unwrap_or(CMD_PORT)).await {
-            println!("Perhaps the backend service has not been started. Use '--cmd-port' to change the port. error={e}");
+        if let Err(e) = ipc::udp::client::groups(addr).await {
+            Err(anyhow!("Perhaps the backend service has not been started. Use '--cmd-port' to change the port. error={e}"))?;
         }
     } else if let Some(group_code) = others {
-        if let Err(e) = ipc::client::other_nodes(cmd_port.unwrap_or(CMD_PORT), group_code).await {
-            println!("Perhaps the backend service has not been started. Use '--cmd-port' to change the port. error={e}");
+        if let Err(e) = ipc::udp::client::other_nodes(addr, group_code).await {
+            Err(anyhow!("Perhaps the backend service has not been started. Use '--cmd-port' to change the port. error={e}"))?;
         }
     } else if info {
-        if let Err(e) = ipc::client::current_info(cmd_port.unwrap_or(CMD_PORT)).await {
-            println!("Perhaps the backend service has not been started. Use '--cmd-port' to change the port. error={e}");
+        if let Err(e) = ipc::udp::client::current_info(addr).await {
+            Err(anyhow!("Perhaps the backend service has not been started. Use '--cmd-port' to change the port. error={e}"))?;
         }
     } else {
-        println!("Use specific commands to view data");
+        Err(anyhow!("Use specific commands to view data"))?;
     }
-}
-#[tokio::main(flavor = "current_thread")]
-async fn main_current_thread(args: Args) -> Result<()> {
-    run(args).await
+    Ok(())
 }
 
-async fn run(args: Args) -> Result<()> {
+async fn main_by_cmd(args: Args) -> anyhow::Result<()> {
     let Args {
         peer,
         local,
@@ -166,7 +208,6 @@ async fn run(args: Args) -> Result<()> {
         command,
         ..
     } = args;
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let mut split = local.split('/');
     let self_id = Ipv4Addr::from_str(split.next().expect("--local error")).expect("--local error");
     let prefix = if let Some(mask) = split.next() {
@@ -174,90 +215,90 @@ async fn run(args: Args) -> Result<()> {
     } else {
         0
     };
-    let mut addrs = Vec::new();
-    if let Some(peers) = peer {
-        for addr in peers {
-            addrs.push(addr.parse::<PeerNodeAddress>().expect("--peer"))
-        }
+    let config_view = ConfigView {
+        group_code,
+        node_ipv4: format!("{self_id}"),
+        prefix,
+        node_ipv6: None,
+        tun_name,
+        encrypt,
+        algorithm,
+        port: port.unwrap_or(LISTEN_PORT),
+        peer,
+        bind_dev_name: bind_dev,
+        exit_node,
+        ..ConfigView::default()
+    };
+    let addr = if let Some(Commands::Cmd {
+        cmd_host, cmd_port, ..
+    }) = command
+    {
+        format!(
+            "{}:{}",
+            cmd_host.unwrap_or(CMD_HOST.to_string()),
+            cmd_port.unwrap_or(CMD_PORT)
+        )
+    } else {
+        format!("{CMD_HOST}:{CMD_PORT}")
+    };
+    start_by_config(config_view, addr).await?;
+    Ok(())
+}
+
+async fn main_by_config_file(file_config: FileConfigView) -> anyhow::Result<()> {
+    let addr = format!("{}:{}", file_config.cmd_host, file_config.cmd_port);
+    let config_view = ConfigView::from(file_config);
+    start_by_config(config_view, addr).await
+}
+
+async fn start_by_config(config_view: ConfigView, cmd_server_addr: String) -> anyhow::Result<()> {
+    let config = config_view.into_config()?;
+
+    let api_service = ApiService::new(config);
+    if let Err(e) = ipc::server_start(cmd_server_addr, api_service.clone()).await {
+        return Err(anyhow!("The backend command port has already been used. Please use '--cmd-port' to change the port, err={e}"));
     }
     let (tx, mut quit) = tokio::sync::mpsc::channel::<()>(1);
 
     ctrlc2::set_async_handler(async move {
-        tx.send(()).await.expect("Signal error");
+        let _ = tx.send(()).await;
     })
     .await;
 
-    let port = port.unwrap_or(LISTEN_PORT);
-    let udp_config = UdpPipeConfig::default().set_simple_udp_port(port);
-    let tcp_config = TcpPipeConfig::default().set_tcp_port(port);
-    let group_code = if let Some(group_code) = string_to_group_code(&group_code) {
-        group_code
-    } else {
-        println!("--group-code is too long");
-        return Ok(());
-    };
-    let mut config = PipeConfig::empty()
+    start(api_service.clone()).await?;
+    _ = quit.recv().await;
+    _ = api_service.close();
+    log::info!("exit!!!!");
+    Ok(())
+}
+
+async fn start(api_service: ApiService) -> anyhow::Result<()> {
+    let config = api_service.load_config();
+
+    let udp_config = UdpPipeConfig::default().set_simple_udp_port(config.port);
+    let tcp_config = TcpPipeConfig::default().set_tcp_port(config.port);
+    let mut pipe_config = PipeConfig::empty()
         .set_udp_pipe_config(udp_config)
         .set_tcp_pipe_config(tcp_config)
-        .set_direct_addrs(addrs)
-        .set_group_code(group_code)
-        .set_node_id(self_id.into());
-    if let Some(bind_dev_name) = bind_dev {
-        let _bind_dev_index = match platform::dev_name_to_index(&bind_dev_name) {
-            Ok(index) => index,
-            Err(e) => {
-                log::error!("--bind-dev error: {e:?}");
-                return Ok(());
-            }
-        };
-        let iface;
-        #[cfg(not(target_os = "linux"))]
-        {
-            log::info!("bind_dev_name={bind_dev_name:?},bind_dev_index={_bind_dev_index}");
-            iface = LocalInterface::new(_bind_dev_index);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            log::info!("bind_dev_name={bind_dev_name:?}");
-            iface = LocalInterface::new(bind_dev_name.clone());
-        }
-        config = config.set_default_interface(iface);
+        .set_direct_addrs(config.peer_addrs)
+        .set_group_code(config.group_code)
+        .set_node_id(config.node_ipv4.into())
+        .set_udp_stun_servers(config.udp_stun)
+        .set_tcp_stun_servers(config.tcp_stun);
+    if let Some(iface) = config.iface_option {
+        pipe_config = pipe_config.set_default_interface(iface);
     }
 
-    let cipher = if let Some(v) = algorithm {
-        match v.to_lowercase().as_str() {
-            "aes-gcm" => encrypt.map(cipher::Cipher::new_aes_gcm),
-            "chacha20-poly1305" => encrypt.map(cipher::Cipher::new_chacha20_poly1305),
-            "xor" => encrypt.map(cipher::Cipher::new_xor),
-            _ => {
-                println!("--algorithm error");
-                return Ok(());
-            }
-        }
-    } else {
-        encrypt.map(cipher::Cipher::new_chacha20_poly1305)
-    };
+    let mut pipe = Pipe::new(pipe_config).await?;
+    let shutdown_manager = ShutdownManager::<()>::new();
 
-    let mut pipe = Pipe::new(config).await?;
-    let writer = pipe.writer();
-    let cmd_port = if let Some(Commands::Cmd { cmd_port, .. }) = command {
-        cmd_port.unwrap_or(CMD_PORT)
-    } else {
-        CMD_PORT
-    };
-    if let Err(e) = ipc::server::start(cmd_port, writer.clone()).await {
-        if e.kind() == io::ErrorKind::AddrInUse {
-            println!("The backend command port has already been used. Please use '--cmd-port' to change the port");
-        }
-        println!("The backend command port has already been used. Please use '--cmd-port' to change the port, err={e}");
-        return Ok(());
-    }
-    let shutdown_writer = writer.clone();
+    api_service.set_pipe(pipe.writer().clone(), shutdown_manager.clone());
+
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<RecvUserData>(256);
-    if prefix > 0 {
-        let mut config = tun_rs::Configuration::default();
-        config
-            .address_with_prefix(self_id, prefix)
+    if config.prefix > 0 {
+        let mut dev_config = tun_rs::Configuration::default();
+        dev_config
+            .address_with_prefix(config.node_ipv4, config.prefix)
             .platform_config(|_v| {
                 #[cfg(windows)]
                 {
@@ -267,10 +308,10 @@ async fn run(args: Args) -> Result<()> {
             })
             .mtu(1400)
             .up();
-        if let Some(name) = tun_name {
-            config.name(name);
+        if let Some(name) = config.tun_name {
+            dev_config.name(name);
         }
-        let device = tun_rs::create_as_async(&config).unwrap();
+        let device = tun_rs::create_as_async(&dev_config)?;
         #[cfg(target_os = "linux")]
         if let Err(e) = device.set_tx_queue_len(1000) {
             log::warn!("set tx_queue_len failed. {e:?}");
@@ -278,19 +319,19 @@ async fn run(args: Args) -> Result<()> {
         let if_index = device.if_index().unwrap();
         let name = device.name().unwrap();
         log::info!("device index={if_index},name={name}",);
-        let mut v6: [u8; 16] = [
-            0xfd, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0, 0, 0, 0,
-        ];
-        v6[12..].copy_from_slice(&self_id.octets());
-        let v6 = Ipv6Addr::from(v6);
-        if let Err(e) = device.add_address_v6(v6.into(), 96) {
-            log::warn!("add ipv6 failed. {e:?},v6={v6}");
-        } else {
-            log::info!("mapped ipv6 addr={v6}");
+        if let Some(v6) = config.node_ipv6 {
+            if let Err(e) = device.add_address_v6(v6.into(), config.prefix_v6) {
+                log::warn!("add ipv6 failed. {e:?},v6={v6}");
+            } else {
+                log::info!("mapped ipv6 addr={v6}");
+            }
         }
-        let external_route = ExternalRoute::new(self_id, prefix);
-        route_listen::route_listen(if_index, external_route.clone()).await?;
-        if let Some(exit_node) = exit_node {
+
+        let external_route = ExternalRoute::new(config.node_ipv4, config.prefix);
+
+        route_listen::route_listen(shutdown_manager.clone(), if_index, external_route.clone())
+            .await?;
+        if let Some(exit_node) = config.exit_node {
             exit_route::exit_route(exit_node, if_index).await?;
         }
         #[cfg(target_os = "macos")]
@@ -300,13 +341,23 @@ async fn run(args: Args) -> Result<()> {
         }
         let device = Arc::new(device);
         let device_r = device.clone();
-        let cipher_ = cipher.clone();
+        let cipher = config.cipher.clone();
+        let writer = pipe.writer();
         tokio::spawn(async move {
-            if let Err(e) = tun_recv(writer, device_r, self_id, external_route, cipher_).await {
+            if let Err(e) = tun_recv(
+                shutdown_manager,
+                writer,
+                device_r,
+                config.node_ipv4,
+                external_route,
+                cipher,
+            )
+            .await
+            {
                 log::warn!("device.recv {e:?}")
             }
         });
-        let cipher = cipher.clone();
+        let cipher = config.cipher.clone();
         tokio::spawn(async move {
             while let Some(mut buf) = receiver.recv().await {
                 if let Some(cipher) = cipher.as_ref() {
@@ -327,7 +378,7 @@ async fn run(args: Args) -> Result<()> {
             }
         });
     }
-    log::info!("listen local port: {port}");
+    log::info!("listen local port: {}", config.port);
 
     tokio::spawn(async move {
         loop {
@@ -341,11 +392,8 @@ async fn run(args: Args) -> Result<()> {
                 }
             }
         }
+        drop(pipe)
     });
-
-    quit.recv().await.expect("quit error");
-    _ = shutdown_writer.shutdown();
-    log::info!("exit!!!!");
     Ok(())
 }
 
@@ -375,6 +423,7 @@ async fn recv(mut line: PipeLine, sender: Sender<RecvUserData>) {
                 if let RecvError::Io(e) = e {
                     log::warn!("recv_from {e:?}");
                 }
+                drop(line);
                 return;
             }
         };
@@ -392,17 +441,25 @@ async fn recv(mut line: PipeLine, sender: Sender<RecvUserData>) {
 }
 
 async fn tun_recv(
+    shutdown_manager: ShutdownManager<()>,
     pipe_writer: PipeWriter,
     device: Arc<AsyncDevice>,
     self_ip: Ipv4Addr,
     external_route: ExternalRoute,
     cipher: Option<cipher::Cipher>,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let self_id: NodeID = self_ip.into();
     loop {
         let mut send_packet = pipe_writer.allocate_send_packet();
         unsafe { send_packet.set_payload_len(send_packet.capacity()) };
-        let payload_len = device.recv(&mut send_packet).await?;
+        let payload_len = if let Ok(rs) = shutdown_manager
+            .wrap_cancel(device.recv(&mut send_packet))
+            .await
+        {
+            rs?
+        } else {
+            return Ok(());
+        };
         unsafe { send_packet.set_payload_len(payload_len) };
         let buf: &mut [u8] = &mut send_packet;
         if buf.len() < 20 {
@@ -461,7 +518,7 @@ async fn tun_recv(
 }
 
 #[cfg(target_os = "macos")]
-async fn process_myself(payload: &[u8], device: &Arc<AsyncDevice>) -> Result<()> {
+async fn process_myself(payload: &[u8], device: &Arc<AsyncDevice>) -> anyhow::Result<()> {
     use pnet_packet::icmp::IcmpTypes;
     use pnet_packet::ip::IpNextHeaderProtocols;
     use pnet_packet::Packet;

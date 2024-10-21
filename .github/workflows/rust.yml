@@ -98,6 +98,14 @@ jobs:
       - name: Use strawberry perl
         if: startsWith(matrix.os, 'windows')
         run: echo OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl >> $GITHUB_ENV
+      - name: Build web
+        run: |
+          cd web-app
+          npm install
+          npm run build
+          cd ..
+          mkdir static
+          cp -r ./web-app/dist/* ./static/
       - name: List
         run: find ./
       - name: Install and configure dependencies

@@ -11,6 +11,7 @@ pub struct RouteItem {
     pub protocol: String,
     pub metric: u8,
     pub rtt: u32,
+    pub interface: String,
 }
 #[derive(Serialize, Deserialize, Debug, Tabled)]
 pub struct GroupItem {
@@ -20,6 +21,7 @@ pub struct GroupItem {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NetworkNatInfo {
+    pub node_ip: Ipv4Addr,
     pub local_ipv4: Ipv4Addr,
     pub ipv6: Option<Ipv6Addr>,
     pub nat_type: NatType,
