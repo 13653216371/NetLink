@@ -1,85 +1,78 @@
-use crate::config::{group_code_to_string, Config, ConfigView};
-use crate::ipc::common::{GroupItem, NetworkNatInfo, RouteItem};
-use async_shutdown::ShutdownManager;
-use parking_lot::Mutex;
-use rustp2p::pipe::PipeWriter;
-use rustp2p::protocol::node_id::GroupCode;
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 use std::sync::Arc;
 
-type PipeInfo = Arc<Mutex<Option<(PipeWriter, ShutdownManager<()>)>>>;
-#[derive(Clone)]
-pub struct ApiService {
-    config: Arc<Mutex<Config>>,
-    pipe: PipeInfo,
+use async_shutdown::ShutdownManager;
+use rustp2p::pipe::PipeWriter;
+
+use crate::api::entity::{GroupItem, NetworkNatInfo, RouteItem};
+use crate::config::{Config, GroupCode};
+use crate::netlink_task::start_netlink;
+use crate::route::ExternalRoute;
+
+pub struct NetLinkCoreApi {
+    config: Config,
+    pipe: Arc<PipeWriter>,
+    shutdown_manager: ShutdownManager<()>,
+    external_route: Option<ExternalRoute>,
 }
 
-impl ApiService {
-    pub fn new(config: Config) -> ApiService {
-        Self {
-            pipe: Default::default(),
-            config: Arc::new(Mutex::new(config)),
-        }
+impl NetLinkCoreApi {
+    pub async fn open(config: Config) -> anyhow::Result<Self> {
+        let (pipe, external_route, shutdown_manager) = start_netlink(
+            config.clone(),
+            #[cfg(unix)]
+            None,
+        )
+        .await?;
+        Ok(Self {
+            config,
+            pipe,
+            shutdown_manager,
+            external_route,
+        })
     }
-    pub fn load_config(&self) -> Config {
-        self.config.lock().clone()
+    /// # Safety
+    /// This method is safe if the provided fd is valid.
+    /// Construct a TUN from an existing file descriptor
+    #[cfg(unix)]
+    pub async unsafe fn open_with_tun_fd(config: Config, tun_fd: u32) -> anyhow::Result<Self> {
+        let (pipe, external_route, shutdown_manager) =
+            start_netlink(config.clone(), Some(tun_fd)).await?;
+        Ok(Self {
+            config,
+            pipe,
+            shutdown_manager,
+            external_route,
+        })
     }
-    pub fn save_config(&self, config: Config) {
-        *self.config.lock() = config;
+    pub fn close(self) {
+        self.shutdown();
     }
-    pub fn set_pipe(&self, pipe_writer: PipeWriter, shutdown_manager: ShutdownManager<()>) {
-        if let Some((v1, v2)) = self.pipe.lock().replace((pipe_writer, shutdown_manager)) {
-            if let Err(e) = v1.shutdown() {
-                log::error!("shutdown failed {e:?}");
-            }
-            if let Err(e) = v2.trigger_shutdown(()) {
-                log::error!("shutdown failed {e:?}");
-            }
-        }
+    pub fn shutdown(&self) {
+        _ = self.pipe.shutdown();
+        _ = self.shutdown_manager.trigger_shutdown(());
     }
-}
-
-impl ApiService {
-    pub fn pipe_writer(&self) -> Option<PipeWriter> {
-        self.pipe.lock().as_ref().map(|(v1, _)| v1.clone())
+    pub async fn wait_shutdown_triggered(&self) {
+        self.shutdown_manager.wait_shutdown_triggered().await
     }
-    pub fn is_close(&self) -> bool {
-        self.pipe.lock().is_none()
+    pub async fn wait_shutdown_complete(&self) {
+        self.shutdown_manager.wait_shutdown_complete().await
     }
-    pub fn close(&self) -> anyhow::Result<()> {
-        let pipe = self.pipe.lock().take();
-        if let Some((pipe_writer, shutdown_manager)) = pipe {
-            let rs1 = shutdown_manager.trigger_shutdown(());
-            let rs2 = pipe_writer.shutdown();
-            rs1?;
-            rs2?;
-        } else {
-            Err(anyhow::anyhow!("Not Started"))?
-        }
-
-        Ok(())
+    pub fn is_shutdown_triggered(&self) -> bool {
+        self.shutdown_manager.is_shutdown_triggered()
     }
-    pub async fn open(&self) -> anyhow::Result<()> {
-        if self.pipe.lock().is_some() {
-            Err(anyhow::anyhow!("Started"))?
-        }
-        crate::start(self.clone()).await?;
-        Ok(())
+    pub fn is_shutdown_completed(&self) -> bool {
+        self.shutdown_manager.is_shutdown_completed()
     }
-    pub fn current_config(&self) -> anyhow::Result<ConfigView> {
-        Ok(self.config.lock().to_config_view())
+    pub fn current_config(&self) -> &Config {
+        &self.config
     }
-    pub fn update_config(&self, config_view: ConfigView) -> anyhow::Result<()> {
-        let config = config_view.into_config()?;
-        self.save_config(config);
-        Ok(())
+    pub(crate) fn pipe_writer(&self) -> &PipeWriter {
+        &self.pipe
     }
     pub fn current_info(&self) -> anyhow::Result<NetworkNatInfo> {
-        let pipe_writer = if let Some(pipe_writer) = self.pipe_writer() {
-            pipe_writer
-        } else {
-            Err(anyhow::anyhow!("Not Started"))?
-        };
+        let pipe_writer = self.pipe_writer();
         let punch_info = pipe_writer.pipe_context().punch_info().read().clone();
         let info = NetworkNatInfo {
             node_ip: pipe_writer
@@ -99,11 +92,7 @@ impl ApiService {
         Ok(info)
     }
     pub fn current_nodes(&self) -> anyhow::Result<Vec<RouteItem>> {
-        let pipe_writer = if let Some(pipe_writer) = self.pipe_writer() {
-            pipe_writer
-        } else {
-            Err(anyhow::anyhow!("Not Started"))?
-        };
+        let pipe_writer = self.pipe_writer();
         let mut list = Vec::new();
         for node_id in pipe_writer.nodes() {
             if let Some(routes) = pipe_writer.lookup_route(&node_id) {
@@ -118,7 +107,7 @@ impl ApiService {
                     };
 
                     list.push(RouteItem {
-                        node_id: format!("{}", Ipv4Addr::from(node_id)),
+                        node_id: Ipv4Addr::from(node_id),
                         next_hop: next_hop.unwrap_or_default(),
                         protocol: format!("{:?}", route.route_key().protocol()),
                         metric: route.metric(),
@@ -131,7 +120,7 @@ impl ApiService {
                 }
             }
             list.push(RouteItem {
-                node_id: format!("{}", Ipv4Addr::from(node_id)),
+                node_id: Ipv4Addr::from(node_id),
                 next_hop: String::new(),
                 protocol: "Not linked".to_string(),
                 metric: 0,
@@ -142,46 +131,36 @@ impl ApiService {
         Ok(list)
     }
     pub fn nodes_by_group(&self, group_code: &str) -> anyhow::Result<Vec<RouteItem>> {
-        let pipe_writer = if let Some(pipe_writer) = self.pipe_writer() {
-            pipe_writer
-        } else {
-            Err(anyhow::anyhow!("Not Started"))?
-        };
-        if let Some(group_code) = crate::string_to_group_code(group_code) {
-            let current_group_code = pipe_writer.current_group_code();
-            if group_code == current_group_code {
-                return self.current_nodes();
-            }
-            return self.other_nodes(&group_code);
+        let pipe_writer = self.pipe_writer();
+        let group_code = GroupCode::from_str(group_code)?;
+        let current_group_code = pipe_writer.current_group_code();
+        if group_code.0 == current_group_code {
+            return self.current_nodes();
         }
-        Err(anyhow::anyhow!("group_code error"))
+        self.other_nodes(&group_code)
     }
     pub fn other_nodes(&self, group_code: &GroupCode) -> anyhow::Result<Vec<RouteItem>> {
-        let pipe_writer = if let Some(pipe_writer) = self.pipe_writer() {
-            pipe_writer
-        } else {
-            Err(anyhow::anyhow!("Not Started"))?
-        };
+        let pipe_writer = self.pipe_writer();
         let mut list = Vec::new();
-        let nodes = if let Some(nodes) = pipe_writer.other_group_nodes(group_code) {
+        let nodes = if let Some(nodes) = pipe_writer.other_group_nodes(&group_code.0) {
             nodes
         } else {
             return Ok(list);
         };
         for node_id in nodes {
-            if let Some(routes) = pipe_writer.other_group_route(group_code, &node_id) {
+            if let Some(routes) = pipe_writer.other_group_route(&group_code.0, &node_id) {
                 let not_empty = !routes.is_empty();
                 for route in routes {
                     let next_hop = if route.is_relay() {
                         pipe_writer
-                            .other_route_to_node_id(group_code, &route.route_key())
+                            .other_route_to_node_id(&group_code.0, &route.route_key())
                             .map(|v| format!("{}", Ipv4Addr::from(v)))
                     } else {
                         Some("Direct-Connection".to_string())
                     };
 
                     list.push(RouteItem {
-                        node_id: format!("{}", Ipv4Addr::from(node_id)),
+                        node_id: Ipv4Addr::from(node_id),
                         next_hop: next_hop.unwrap_or_default(),
                         protocol: format!("{:?}", route.route_key().protocol()),
                         metric: route.metric(),
@@ -194,7 +173,7 @@ impl ApiService {
                 }
             }
             list.push(RouteItem {
-                node_id: format!("{}", Ipv4Addr::from(node_id)),
+                node_id: Ipv4Addr::from(node_id),
                 next_hop: String::new(),
                 protocol: "Not linked".to_string(),
                 metric: 0,
@@ -205,16 +184,12 @@ impl ApiService {
         Ok(list)
     }
     pub fn groups(&self) -> anyhow::Result<Vec<GroupItem>> {
-        let pipe_writer = if let Some(pipe_writer) = self.pipe_writer() {
-            pipe_writer
-        } else {
-            Err(anyhow::anyhow!("Not Started"))?
-        };
+        let pipe_writer = self.pipe_writer();
         let mut group_codes = Vec::new();
         let current_group_code = pipe_writer.current_group_code();
         let current_node_num = pipe_writer.nodes().len();
         group_codes.push(GroupItem {
-            group_code: group_code_to_string(&current_group_code),
+            group_code: GroupCode(current_group_code).to_string(),
             node_num: current_node_num,
         });
         let vec = pipe_writer.other_group_codes();
@@ -223,12 +198,28 @@ impl ApiService {
                 .other_group_nodes(&code)
                 .map(|v| v.len())
                 .unwrap_or_default();
-            let group_code = group_code_to_string(&code);
             group_codes.push(GroupItem {
-                group_code,
+                group_code: GroupCode(code).to_string(),
                 node_num,
             });
         }
         Ok(group_codes)
+    }
+    pub fn update_external_route(
+        &self,
+        route_table: Vec<(u32, u32, Ipv4Addr)>,
+    ) -> anyhow::Result<()> {
+        if let Some(external_route) = self.external_route.as_ref() {
+            external_route.update(route_table);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Does not support routing"))
+        }
+    }
+}
+impl Drop for NetLinkCoreApi {
+    fn drop(&mut self) {
+        let _ = self.pipe.shutdown();
+        let _ = self.shutdown_manager.trigger_shutdown(());
     }
 }

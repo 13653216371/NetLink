@@ -6,24 +6,31 @@
 NetLink is a decentralized networking tool built on the [rustp2p](https://crates.io/crates/rustp2p) library.
 
 ```
+Usage: ./netLink.exe 
+Usage: ./netLink.exe --api_addr 192.168.0.1:8080
 Usage: netLink.exe [OPTIONS] --local <LOCAL IP> --group-code <GROUP CODE>
 
-Commands:
-  cmd   Backend command
-  help  Print this message or the help of the given subcommand(s)
-
 Options:
-  -p, --peer <PEER>              Peer node address. e.g.: -p tcp://192.168.10.13:23333 -p udp://192.168.10.23:23333
-  -l, --local <LOCAL IP>         Local node IP and prefix. e.g.: -l 10.26.0.2/24
+  -p, --peer <PEER>              Peer node address. e.g.: -p tcp://192.168.10.13:23333 -p udp://192.168.10.23:23333 -p txt://domain
+  -l, --local <LOCAL IP>         Local node IP and prefix.If there is no 'prefix', Will not enable Tun. e.g.: -l 10.26.0.2/24
   -g, --group-code <GROUP CODE>  Nodes with the same group_code can form a network (Maximum length 16)
-  -P, --port <PORT>              Listen local port
+  -P, --port <PORT>              Listen local port [default: 23333]
   -b, --bind-dev <DEVICE NAME>   Bind the outgoing network interface (using the interface name). e.g.: -b eth0
-      --threads <THREADS>        Set the number of threads, default to 2
+      --threads <THREADS>        Set the number of threads [default: 2]
   -e, --encrypt <PASSWORD>       Enable data encryption. e.g.: -e "password"
-  -a, --algorithm <ALGORITHM>    Set encryption algorithm. Optional aes-gcm/chacha20-poly1305/xor, default is chacha20-poly1305
+  -a, --algorithm <ALGORITHM>    Set encryption algorithm. Optional aes-gcm/chacha20-poly1305/xor [default: chacha20-poly1305]
       --exit-node <EXIT_NODE>    Global exit node,please use it together with '--bind-dev'
       --tun-name <TUN_NAME>      Set tun name
+      --mtu <MTU>                Set tun mtu
+  -X, --filter <FILTER>          Group code whitelist, using regular expressions
   -f, --config <CONFIG>          Start using configuration file
+      --api-addr <API_ADDR>      Set backend http server address [default: 127.0.0.1:23336]
+      --api-disable              Disable backend http server
+      --username <USER_NAME>     http username to login
+      --password <PASSWORD>      http password to login
+  -h, --help                     Print help information
+  -V, --version                  Print version information
+
  ```
 
 ## Start with config file
@@ -34,17 +41,22 @@ Options:
 ## ./netLink --config <config_file_path>
 ## On demand use, unnecessary configurations can be deleted
 
-## Command server host. default is "127.0.0.1"
-#cmd_host: "127.0.0.1"
-## Command server port. default is 23336
-#cmd_port: 23336
+## Api server host. default is "127.0.0.1:23336"
+#api_addr: "127.0.0.1:23336"
+## Disable api. api_disable:true
+#api_disable: false
 ## Number of program task threads. default is 2
 #threads: 2
+## http username to login
+#username: 
+## http password to login
+#password: 
+
 ## group code. cannot be empty
 group_code: String
 ## node tun ipv4. cannot be empty
 node_ipv4: "10.26.1.2"
-## node tun network prefix. default is 24
+## node tun network prefix. default is 24.If prefix=0, do not listen to the Tun network, and can only act as a relay node at this time
 #prefix: 24
 ## node tun ipv6. The program will automatically generate node_ipv6
 # node_ipv6: 
@@ -66,6 +78,12 @@ node_ipv4: "10.26.1.2"
 #bind_dev_name: "eth0"
 ## Global exit node,please use it together with "bind_dev_name"
 #exit_node: 
+## Set tun mtu
+#mtu: 1400
+## Group code whitelist, using regular expressions
+#group_code_filter:
+#   - ^test # Starting with 'test'
+#   - ^pass$ # eq pass
 
 ## stun server addr
 #udp_stun:
@@ -97,16 +115,17 @@ node_ipv4: "10.26.1.2"
 
 ## Features
 
-| Features           |   |
-|--------------------|---| 
-| **Decentralized**  | ✅ |
-| **Cross-platform** | ✅ |
-| **NAT traversal**  | ✅ | 
-| **Subnet route**   | ✅ | 
-| **Encryption**     | ✅ | 
-| **Efficient**      | ✅ | 
-| **IPv6/Ipv4**      | ✅ | 
-| **UDP/TCP**        | ✅ | 
+| Features                |   |
+|-------------------------|---| 
+| **Decentralized**       | ✅ |
+| **Cross-platform**      | ✅ |
+| **NAT traversal**       | ✅ | 
+| **Subnet route**        | ✅ | 
+| **Encryption**          | ✅ | 
+| **Efficient**           | ✅ | 
+| **HTTP/Rust/C/JNI API** | ✅ | 
+| **IPv6/IPv4**           | ✅ | 
+| **UDP/TCP**             | ✅ | 
 
 ## Quick Start
 
@@ -251,6 +270,10 @@ Node-C <--> Node-A(192.168.10.2) <--> Node-B(192.168.10.3)
 
 At this point, Node-C can access the IP address of Node-B(192.168.10.3) via Node-A as if Node-C was directly connected
 to Node-B.
+
+## Link library
+
+https://github.com/rustp2p/NetLink_adapter
 
 ## Contact
 

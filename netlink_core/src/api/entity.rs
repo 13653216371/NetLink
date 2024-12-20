@@ -2,18 +2,17 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use rustp2p::config::NatType;
 use serde::{Deserialize, Serialize};
-use tabled::Tabled;
 
-#[derive(Serialize, Deserialize, Debug, Tabled)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct RouteItem {
-    pub node_id: String,
+    pub node_id: Ipv4Addr,
     pub next_hop: String,
     pub protocol: String,
     pub metric: u8,
     pub rtt: u32,
     pub interface: String,
 }
-#[derive(Serialize, Deserialize, Debug, Tabled)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct GroupItem {
     pub group_code: String,
     pub node_num: usize,
